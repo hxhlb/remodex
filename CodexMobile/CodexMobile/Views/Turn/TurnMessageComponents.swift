@@ -14,6 +14,27 @@ import UIKit
 // plain markdown rows and Mermaid-interleaved markdown segments.
 let enablesInlineMarkdownSelectionInTimeline = false
 
+// Normalizes streaming placeholders once so assistant rows do not render transient status text
+// like "Thinking..." as if it were final message content.
+func timelineDisplayText(for message: CodexMessage) -> String {
+    let trimmedText = message.text.trimmingCharacters(in: .whitespacesAndNewlines)
+    if message.isStreaming {
+        let placeholderTexts: Set<String> = [
+            "...",
+            "Thinking...",
+            "Applying file changes...",
+            "Updating...",
+            "Coordinating agents...",
+            "Planning...",
+            "Waiting for input...",
+        ]
+        if trimmedText.isEmpty || placeholderTexts.contains(trimmedText) {
+            return ""
+        }
+    }
+    return trimmedText
+}
+
 // ─── Message content views ──────────────────────────────────────────
 
 // ─── File-Change Recap UI ─────────────────────────────────────
@@ -86,9 +107,13 @@ struct MarkdownTextView: View {
     var body: some View {
         let transformed = MarkdownTextFormatter.renderableText(from: text, profile: profile)
         // Keep prose on the app font, but let Textual own markdown/code layout to avoid block sizing regressions.
+        // Force code-block overflow to wrap instead of scroll so horizontal ScrollViews
+        // inside the timeline do not compete with the sidebar swipe gesture or let
+        // the chat feel like a pannable canvas.
         let baseView = StructuredText(transformed, parser: CachingMarkdownParser.shared)
             .font(AppFont.body())
             .textual.structuredTextStyle(.gitHub)
+            .textual.overflowMode(.wrap)
 
         if enablesSelection {
             baseView
@@ -560,14 +585,70 @@ private enum AttachmentPreviewImageResolver {
 
 // ─── Message row ────────────────────────────────────────────────────
 
+private struct UserBubbleTextBlock<Content: View>: View {
+    private static var collapseLineLimit: Int { 10 }
+    private static var collapseCharacterThreshold: Int { 360 }
+    private static var collapseNewlineThreshold: Int { 8 }
+
+    let contentIdentity: String
+    let rawText: String
+    @ViewBuilder let content: () -> Content
+
+    @State private var isExpanded = false
+
+    private var canCollapse: Bool {
+        let newlineCount = rawText.reduce(into: 0) { count, character in
+            if character == "\n" {
+                count += 1
+            }
+        }
+        return rawText.count > Self.collapseCharacterThreshold
+            || newlineCount >= Self.collapseNewlineThreshold
+    }
+
+    private var collapseResetKey: Int {
+        var hasher = Hasher()
+        hasher.combine(contentIdentity)
+        hasher.combine(rawText)
+        return hasher.finalize()
+    }
+
+    var body: some View {
+        VStack(alignment: .trailing, spacing: 4) {
+            content()
+                .lineLimit(canCollapse ? (isExpanded ? nil : Self.collapseLineLimit) : nil)
+
+            if canCollapse {
+                Button(isExpanded ? "Show less" : "Show more") {
+                    withAnimation(.easeInOut(duration: 0.18)) {
+                        isExpanded.toggle()
+                    }
+                }
+                .buttonStyle(.plain)
+                .font(AppFont.footnote())
+                .foregroundStyle(.secondary)
+            }
+        }
+        .onChange(of: collapseResetKey) { _, _ in
+            isExpanded = false
+        }
+    }
+}
+
 struct MessageRow: View, Equatable {
-    @Environment(CodexService.self) private var codex
 
     let message: CodexMessage
     let isRetryAvailable: Bool
     let onRetryUserMessage: (String) -> Void
     // Keeps the end-of-block accessory aligned with the active assistant turn.
     var assistantBlockAccessoryState: AssistantBlockAccessoryState? = nil
+    var planSessionSource: CodexPlanSessionSource? = nil
+    var allowsAssistantPlanFallbackRecovery: Bool = false
+    var assistantTurnCompleted: Bool = false
+    var threadMessagesForPlanMatching: [CodexMessage] = []
+    // Narrow token for inferred-plan fallback invalidation; this changes only when the
+    // relevant native structured prompts change, not on every unrelated service mutation.
+    var planMatchingFingerprint: Int = 0
     // Disables timer-driven adornments while the user reads older content.
     var showsStreamingAnimations: Bool = true
     // Passed as init params instead of @Environment so .equatable() can short-circuit
@@ -581,27 +662,16 @@ struct MessageRow: View, Equatable {
         lhs.message == rhs.message
             && lhs.isRetryAvailable == rhs.isRetryAvailable
             && lhs.assistantBlockAccessoryState == rhs.assistantBlockAccessoryState
+            && lhs.planSessionSource == rhs.planSessionSource
+            && lhs.allowsAssistantPlanFallbackRecovery == rhs.allowsAssistantPlanFallbackRecovery
+            && lhs.assistantTurnCompleted == rhs.assistantTurnCompleted
+            && lhs.planMatchingFingerprint == rhs.planMatchingFingerprint
             && lhs.showsStreamingAnimations == rhs.showsStreamingAnimations
     }
 
     // Computed once per body evaluation and reused by all sub-views.
     private var displayText: String {
-        let trimmedText = message.text.trimmingCharacters(in: .whitespacesAndNewlines)
-        if message.isStreaming {
-            let placeholderTexts: Set<String> = [
-                "...",
-                "Thinking...",
-                "Applying file changes...",
-                "Updating...",
-                "Coordinating agents...",
-                "Planning...",
-                "Waiting for input...",
-            ]
-            if trimmedText.isEmpty || placeholderTexts.contains(trimmedText) {
-                return ""
-            }
-        }
-        return trimmedText
+        timelineDisplayText(for: message)
     }
 
     var body: some View {
@@ -626,6 +696,8 @@ struct MessageRow: View, Equatable {
                         )
                     }
                 }
+                // Keep block-end actions pinned left when a system row is the last item in a turn.
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
         .sheet(item: $selectableTextSheet) { sheet in
@@ -646,8 +718,13 @@ struct MessageRow: View, Equatable {
                 }
 
                 if !text.isEmpty {
-                    userBubbleText(text)
-                        .font(AppFont.body())
+                    UserBubbleTextBlock(
+                        contentIdentity: message.id,
+                        rawText: text
+                    ) {
+                        userBubbleText(text)
+                            .font(AppFont.body())
+                    }
                         .padding(.vertical, 12)
                         .padding(.horizontal, 16)
                         .background {
@@ -826,7 +903,7 @@ struct MessageRow: View, Equatable {
         let assistantProposedPlanCandidate = commentContent == nil && mermaidContent == nil
             ? (message.proposedPlan ?? CodexProposedPlanParser.parse(from: bodyText))
             : nil
-        let currentPlanSessionSource = codex.currentPlanSessionSource(for: message.threadId)
+        let currentPlanSessionSource = planSessionSource
         let isNativePlanSession = currentPlanSessionSource != nil && currentPlanSessionSource != .compatibilityFallback
         let proposedPlan = !isNativePlanSession
             ? (assistantProposedPlanCandidate
@@ -836,10 +913,9 @@ struct MessageRow: View, Equatable {
                         && currentPlanSessionSource == .compatibilityFallback
                         && InferredPlanQuestionnaireParser.parseAssistantMessage(bodyText) == nil
                     ? CodexProposedPlanParser.parseAssistantFallback(from: bodyText)
-                    : nil
+                            : nil
                 ))
             : nil
-        let assistantTurnCompleted = codex.turnTerminalState(for: message.turnId) == .completed
         let renderedPlanText = assistantProposedPlanCandidate == nil
             ? bodyText
             : (
@@ -851,11 +927,8 @@ struct MessageRow: View, Equatable {
             ? resolvedInferredPlanQuestionnaire(
                 bodyText: bodyText,
                 message: message,
-                threadMessages: codex.messages(for: message.threadId),
-                shouldRecoverFallback: codex.allowsAssistantPlanFallbackRecovery(
-                    for: message.threadId,
-                    turnId: message.turnId
-                ),
+                threadMessages: threadMessagesForPlanMatching,
+                shouldRecoverFallback: allowsAssistantPlanFallbackRecovery,
                 parse: InferredPlanQuestionnaireParser.parseAssistantMessage
             )
             : nil
@@ -1107,9 +1180,9 @@ struct MessageRow: View, Equatable {
     @State private var isShowingBlockDiffSheet = false
 
     private var hasTurnEndActions: Bool {
-        guard let accessory = assistantBlockAccessoryState else { return false }
-        return accessory.blockRevertPresentation != nil
-            || accessory.blockDiffEntries != nil
+        AssistantTurnEndActionVisibility.shouldShow(
+            accessoryState: assistantBlockAccessoryState
+        )
     }
 
     private var isInlineCommitAndPushRunning: Bool {
@@ -1767,6 +1840,16 @@ struct ToolCallSystemBlockPreviewHost: View {
             )
         }
         .environment(CodexService())
+    }
+}
+
+enum AssistantTurnEndActionVisibility {
+    // Ties Diff/Revert to the block's own streaming state so interrupted and
+    // turn-less recovered rows keep their end-of-turn controls once settled.
+    static func shouldShow(accessoryState: AssistantBlockAccessoryState?) -> Bool {
+        guard let accessoryState, !accessoryState.showsRunningIndicator else { return false }
+        return accessoryState.blockRevertPresentation != nil
+            || accessoryState.blockDiffEntries != nil
     }
 }
 

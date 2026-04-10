@@ -114,7 +114,7 @@ struct TurnComposerView: View {
                 ZStack(alignment: .topLeading) {
                     if input.isEmpty {
                         Text("Ask anything... @files, $skills, /commands")
-                            .font(AppFont.system(size: 15))
+                            .font(AppFont.body())
                             .foregroundStyle(Color(.placeholderText))
                             .allowsHitTesting(false)
                     }
@@ -280,6 +280,7 @@ private struct TurnComposerAutocompletePanels: View {
                     isThreadRunning: state.isThreadRunning,
                     showsGitBranchSelector: state.showsGitBranchSelector,
                     isLoadingGitBranchTargets: state.isLoadingGitBranchTargets,
+                    availableGitBranchTargets: state.availableGitBranchTargets,
                     selectedGitBaseBranch: state.selectedGitBaseBranch,
                     gitDefaultBranch: state.gitDefaultBranch,
                     onSelectCommand: onSelectSlashCommand,
@@ -473,6 +474,7 @@ private struct QueuedDraftsPanelPreviewWrapper: View {
                     isThreadRunning: true,
                     showsGitBranchSelector: false,
                     isLoadingGitBranchTargets: false,
+                    availableGitBranchTargets: [],
                     selectedGitBaseBranch: "",
                     gitDefaultBranch: "main"
                 ),
