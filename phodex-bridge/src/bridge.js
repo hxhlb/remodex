@@ -6,7 +6,7 @@
 
 const WebSocket = require("ws");
 const { randomBytes } = require("crypto");
-const { execFile } = require("child_process");
+const { execFile, spawn } = require("child_process");
 const os = require("os");
 const { promisify } = require("util");
 const {
@@ -18,6 +18,7 @@ const { createThreadRolloutActivityWatcher } = require("./rollout-watch");
 const { printQR } = require("./qr");
 const { rememberActiveThread } = require("./session-state");
 const { handleDesktopRequest } = require("./desktop-handler");
+const { readDaemonConfig, writeDaemonConfig } = require("./daemon-state");
 const { handleGitRequest } = require("./git-handler");
 const { handleThreadContextRequest } = require("./thread-context-handler");
 const { handleWorkspaceRequest } = require("./workspace-handler");
@@ -43,6 +44,7 @@ const {
   buildIOSAppCompatibilitySnapshot,
   normalizeVersionString,
 } = require("./ios-app-compatibility");
+const { createShortPairingCode, SHORT_PAIRING_CODE_LENGTH } = require("./qr");
 
 const execFileAsync = promisify(execFile);
 const RELAY_WATCHDOG_PING_INTERVAL_MS = 10_000;
@@ -53,10 +55,14 @@ const RELAY_HISTORY_IMAGE_REFERENCE_URL = "remodex://history-image-elided";
 function startBridge({
   config: explicitConfig = null,
   printPairingQr = true,
-  onPairingPayload = null,
+  onPairingSession = null,
   onBridgeStatus = null,
 } = {}) {
   const config = explicitConfig || readBridgeConfig();
+  config.keepMacAwakeEnabled = config.keepMacAwakeEnabled !== false;
+  const bridgeWakeAssertion = createMacOSBridgeWakeAssertion({
+    enabled: config.keepMacAwakeEnabled,
+  });
   const relayBaseUrl = config.relayUrl.replace(/\/+$/, "");
   if (!relayBaseUrl) {
     console.error("[remodex] No relay URL configured.");
@@ -114,6 +120,7 @@ function startBridge({
   let lastRelayActivityAt = 0;
   let lastPublishedBridgeStatus = null;
   let lastConnectionStatus = null;
+  let codexLaunchState = config.codexEndpoint ? "connected" : "starting";
   let codexHandshakeState = config.codexEndpoint ? "warm" : "cold";
   const forwardedInitializeRequestIds = new Set();
   const bridgeManagedCodexRequestWaiters = new Map();
@@ -167,6 +174,7 @@ function startBridge({
   const codex = createCodexTransport({
     endpoint: config.codexEndpoint,
     env: process.env,
+    appPath: config.codexAppPath,
     logPrefix: "[remodex]",
   });
   const voiceHandler = createVoiceHandler({
@@ -182,6 +190,7 @@ function startBridge({
   });
 
   codex.onError((error) => {
+    codexLaunchState = "error";
     publishBridgeStatus({
       state: "error",
       connectionStatus: "error",
@@ -197,6 +206,15 @@ function startBridge({
     }
     console.error(error.message);
     process.exit(1);
+  });
+  // Marks the local Codex runtime as launchable before relay/network recovery updates.
+  codex.onStarted(() => {
+    codexLaunchState = "connected";
+    if (!lastPublishedBridgeStatus) {
+      return;
+    }
+
+    publishBridgeStatus(lastPublishedBridgeStatus);
   });
 
   function clearReconnectTimer() {
@@ -303,6 +321,7 @@ function startBridge({
       logConnectionStatus("disconnected");
       shutdown(codex, () => socket, () => {
         isShuttingDown = true;
+        bridgeWakeAssertion.stop();
         clearReconnectTimer();
         clearRelayWatchdog();
         clearBridgeStatusHeartbeat();
@@ -334,7 +353,7 @@ function startBridge({
       headers: {
         "x-role": "mac",
         "x-notification-secret": notificationSecret,
-        ...buildMacRegistrationHeaders(deviceState),
+        ...buildMacRegistrationHeaders(deviceState, pairingSession),
       },
     });
     socket = nextSocket;
@@ -397,9 +416,13 @@ function startBridge({
   }
 
   const pairingPayload = secureTransport.createPairingPayload();
-  onPairingPayload?.(pairingPayload);
+  const pairingSession = {
+    pairingPayload,
+    pairingCode: createShortPairingCode({ length: SHORT_PAIRING_CODE_LENGTH }),
+  };
+  onPairingSession?.(pairingSession);
   if (printPairingQr) {
-    printQR(pairingPayload);
+    printQR(pairingSession);
   }
   pushServiceClient.logUnavailable();
   connectRelay();
@@ -430,6 +453,7 @@ function startBridge({
       lastError: "",
     });
     isShuttingDown = true;
+    bridgeWakeAssertion.stop();
     clearReconnectTimer();
     stopContextUsageWatcher();
     rolloutLiveMirror?.stopAll();
@@ -443,12 +467,14 @@ function startBridge({
 
   process.on("SIGINT", () => shutdown(codex, () => socket, () => {
     isShuttingDown = true;
+    bridgeWakeAssertion.stop();
     clearReconnectTimer();
     clearRelayWatchdog();
     clearBridgeStatusHeartbeat();
   }));
   process.on("SIGTERM", () => shutdown(codex, () => socket, () => {
     isShuttingDown = true;
+    bridgeWakeAssertion.stop();
     clearReconnectTimer();
     clearRelayWatchdog();
     clearBridgeStatusHeartbeat();
@@ -477,6 +503,8 @@ function startBridge({
     if (handleDesktopRequest(rawMessage, sendApplicationResponse, {
       bundleId: config.codexBundleId,
       appPath: config.codexAppPath,
+      readBridgePreferences,
+      updateBridgePreferences,
     })) {
       return;
     }
@@ -1020,8 +1048,12 @@ function startBridge({
   }
 
   function publishBridgeStatus(status) {
-    lastPublishedBridgeStatus = status;
-    onBridgeStatus?.(status);
+    const nextStatus = {
+      ...status,
+      codexLaunchState,
+    };
+    lastPublishedBridgeStatus = nextStatus;
+    onBridgeStatus?.(nextStatus);
   }
 
   // Refreshes the relay's trusted-mac index after the QR bootstrap locks in a phone identity.
@@ -1033,18 +1065,141 @@ function startBridge({
 
     socket.send(JSON.stringify({
       kind: "relayMacRegistration",
-      registration: buildMacRegistration(nextDeviceState),
+      registration: buildMacRegistration(nextDeviceState, pairingSession),
     }));
+  }
+
+  function readBridgePreferences() {
+    return {
+      success: true,
+      preferences: {
+        keepMacAwake: config.keepMacAwakeEnabled !== false,
+      },
+      applied: bridgeWakeAssertion.active,
+    };
+  }
+
+  function updateBridgePreferences(preferences = {}) {
+    const nextKeepMacAwakeEnabled = preferences.keepMacAwake !== false;
+    config.keepMacAwakeEnabled = nextKeepMacAwakeEnabled;
+    bridgeWakeAssertion.setEnabled?.(nextKeepMacAwakeEnabled);
+
+    try {
+      persistBridgePreferences({
+        keepMacAwakeEnabled: nextKeepMacAwakeEnabled,
+      });
+    } catch (error) {
+      const nextError = new Error("Could not save the bridge preference on this Mac.");
+      nextError.errorCode = "bridge_preferences_persist_failed";
+      nextError.userMessage = nextError.message;
+      nextError.cause = error;
+      throw nextError;
+    }
+
+    return readBridgePreferences();
   }
 }
 
+// Holds a single macOS idle-sleep assertion for as long as the bridge process stays alive.
+function createMacOSBridgeWakeAssertion({
+  platform = process.platform,
+  pid = process.pid,
+  spawnImpl = spawn,
+  consoleImpl = console,
+  enabled = true,
+} = {}) {
+  if (platform !== "darwin") {
+    return {
+      active: false,
+      enabled: false,
+      setEnabled() {
+        return { active: false, enabled: false };
+      },
+      stop() {},
+    };
+  }
+
+  let desiredEnabled = Boolean(enabled);
+  let child = null;
+
+  function stop() {
+    if (!child || child.killed || typeof child.kill !== "function") {
+      child = null;
+      return;
+    }
+
+    try {
+      child.kill();
+    } catch {}
+    child = null;
+  }
+
+  function start() {
+    if (!desiredEnabled || child) {
+      return;
+    }
+
+    try {
+      const nextChild = spawnImpl("/usr/bin/caffeinate", ["-i", "-w", String(pid)], {
+        stdio: "ignore",
+      });
+
+      nextChild.on?.("error", (error) => {
+        consoleImpl.warn(`[remodex] Failed to hold the Mac awake while the bridge is active: ${error.message}`);
+      });
+      nextChild.on?.("exit", () => {
+        if (child === nextChild) {
+          child = null;
+        }
+      });
+      nextChild.unref?.();
+      child = nextChild;
+    } catch (error) {
+      consoleImpl.warn(
+        `[remodex] Failed to start the bridge wake assertion: ${(error && error.message) || "unknown error"}`
+      );
+      child = null;
+    }
+  }
+
+  function setEnabled(nextEnabled) {
+    desiredEnabled = Boolean(nextEnabled);
+    if (desiredEnabled) {
+      start();
+    } else {
+      stop();
+    }
+
+    return {
+      active: Boolean(child && !child.killed),
+      enabled: desiredEnabled,
+    };
+  }
+
+  start();
+
+  return {
+    get active() {
+      return Boolean(child && !child.killed);
+    },
+    get enabled() {
+      return desiredEnabled;
+    },
+    setEnabled,
+    stop,
+  };
+}
+
 // Registers the canonical Mac identity and the one trusted iPhone allowed for auto-resolve.
-function buildMacRegistrationHeaders(deviceState) {
-  const registration = buildMacRegistration(deviceState);
+function buildMacRegistrationHeaders(deviceState, pairingSession) {
+  const registration = buildMacRegistration(deviceState, pairingSession);
   const headers = {
     "x-mac-device-id": registration.macDeviceId,
     "x-mac-identity-public-key": registration.macIdentityPublicKey,
     "x-machine-name": registration.displayName,
+    "x-pairing-code": registration.pairingCode,
+    "x-pairing-version": registration.pairingVersion ? String(registration.pairingVersion) : "",
+    "x-pairing-expires-at": registration.pairingExpiresAt ? String(registration.pairingExpiresAt) : "",
   };
   if (registration.trustedPhoneDeviceId && registration.trustedPhonePublicKey) {
     headers["x-trusted-phone-device-id"] = registration.trustedPhoneDeviceId;
@@ -1053,7 +1208,7 @@ function buildMacRegistrationHeaders(deviceState) {
   return headers;
 }
 
-function buildMacRegistration(deviceState) {
+function buildMacRegistration(deviceState, pairingSession) {
   const trustedPhoneEntry = Object.entries(deviceState?.trustedPhones || {})[0] || null;
   return {
     macDeviceId: normalizeNonEmptyString(deviceState?.macDeviceId),
@@ -1061,6 +1216,11 @@ function buildMacRegistration(deviceState) {
     displayName: normalizeNonEmptyString(os.hostname()),
     trustedPhoneDeviceId: normalizeNonEmptyString(trustedPhoneEntry?.[0]),
     trustedPhonePublicKey: normalizeNonEmptyString(trustedPhoneEntry?.[1]),
+    pairingCode: normalizeNonEmptyString(pairingSession?.pairingCode),
+    pairingVersion: Number.isInteger(pairingSession?.pairingPayload?.v) ? pairingSession.pairingPayload.v : 0,
+    pairingExpiresAt: Number.isFinite(pairingSession?.pairingPayload?.expiresAt)
+      ? pairingSession.pairingPayload.expiresAt
+      : 0,
   };
 }
 
@@ -1379,9 +1539,26 @@ function buildHeartbeatBridgeStatus(
   };
 }
 
+function persistBridgePreferences(
+  {
+    keepMacAwakeEnabled,
+  },
+  {
+    readDaemonConfigImpl = readDaemonConfig,
+    writeDaemonConfigImpl = writeDaemonConfig,
+  } = {}
+) {
+  writeDaemonConfigImpl({
+    ...(readDaemonConfigImpl() || {}),
+    keepMacAwakeEnabled,
+  });
+}
+
 module.exports = {
   buildHeartbeatBridgeStatus,
+  createMacOSBridgeWakeAssertion,
   hasRelayConnectionGoneStale,
+  persistBridgePreferences,
   sanitizeThreadHistoryImagesForRelay,
   startBridge,
 };

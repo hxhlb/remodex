@@ -9,8 +9,8 @@ import Foundation
 extension CodexService {
     // Keeps sidebar/project loading focused on recent live conversations while
     // retaining a smaller archived slice for restart/recovery flows.
-    var recentActiveThreadListLimit: Int { 60 }
-    var recentArchivedThreadListLimit: Int { 20 }
+    var recentActiveThreadListLimit: Int { 70 }
+    var recentArchivedThreadListLimit: Int { 10 }
 
     // Encodes manual approval replies using the app-server decision object shape.
     func approvalDecisionResult(_ decision: String) -> JSONValue {
@@ -136,12 +136,15 @@ extension CodexService {
                 if let runtimeOverride, !runtimeOverride.isEmpty {
                     applyThreadRuntimeOverride(runtimeOverride, to: thread.id)
                 }
+                // Mark the fresh thread as resumed before publishing it so the first
+                // render can skip the transient loading state while the empty composer
+                // is already the right answer.
+                resumedThreadIDs.insert(thread.id)
                 upsertThread(thread, treatAsServerState: true)
                 if let normalizedProjectPath = thread.normalizedProjectPath,
                    CodexThread.projectIconSystemName(for: normalizedProjectPath) == "arrow.triangle.branch" {
                     rememberAssociatedManagedWorktreePath(normalizedProjectPath, for: thread.id)
                 }
-                resumedThreadIDs.insert(thread.id)
                 activeThreadId = thread.id
                 return thread
             } catch {

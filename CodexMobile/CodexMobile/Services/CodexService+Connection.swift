@@ -117,13 +117,15 @@ extension CodexService {
                     allowAvailableBridgeUpdatePrompt: self?.isAppInForeground ?? false
                 )
                 self?.startGPTLoginSyncIfNeeded()
+                await self?.syncBridgeKeepMacAwakePreferenceIfNeeded()
             }
         } catch {
             let shouldResetSavedSession = recordTrustedReconnectFailureIfNeeded(
                 isTrustedReconnectAttempt: isTrustedReconnectAttempt
             )
             presentConnectionErrorIfNeeded(error)
-            await disconnect()
+            // Keep foreground auto-recovery armed across internal reconnect failures.
+            await disconnect(preserveReconnectIntent: shouldAutoReconnectOnForeground)
             if shouldResetSavedSession {
                 recoverTrustedReconnectCandidate()
             }
@@ -180,6 +182,34 @@ extension CodexService {
         cancelTrustedSessionResolve()
 
         failAllPendingRequests(with: CodexServiceError.disconnected)
+    }
+
+    func setKeepMacAwakeWhileBridgeRunsPreference(_ enabled: Bool) {
+        keepMacAwakeWhileBridgeRuns = enabled
+        defaults.set(enabled, forKey: Self.keepMacAwakeWhileBridgeRunsDefaultsKey)
+    }
+
+    func updateBridgeKeepMacAwakePreference(_ enabled: Bool) async {
+        setKeepMacAwakeWhileBridgeRunsPreference(enabled)
+        await syncBridgeKeepMacAwakePreferenceIfNeeded(showFailureInUI: true)
+    }
+
+    func syncBridgeKeepMacAwakePreferenceIfNeeded(showFailureInUI: Bool = false) async {
+        guard isConnected else {
+            return
+        }
+
+        let handoffService = DesktopHandoffService(codex: self)
+
+        do {
+            try await handoffService.updateBridgeKeepMacAwakePreference(
+                enabled: keepMacAwakeWhileBridgeRuns
+            )
+        } catch {
+            if showFailureInUI {
+                lastErrorMessage = error.localizedDescription
+            }
+        }
     }
 
     // Clears the remembered relay pairing when the remote Mac session is gone for good.
@@ -386,7 +416,6 @@ extension CodexService {
         cancelCurrentSocketConnection()
 
         let disposition = receiveErrorDisposition(for: error, relayCloseCode: relayCloseCode)
-        let wasTrustedReconnectAttempt = secureConnectionState == .reconnecting
         isConnected = false
         isInitialized = false
         shouldAutoReconnectOnForeground = disposition.shouldAutoReconnectOnForeground
@@ -396,15 +425,9 @@ extension CodexService {
             // Reset volatile secure state so reconnect UI does not keep showing the last encrypted session.
             resetSecureTransportState()
         }
-        if wasTrustedReconnectAttempt && !disposition.shouldClearSavedRelaySession {
-            if recordTrustedReconnectFailureIfNeeded(isTrustedReconnectAttempt: true) {
-                shouldAutoReconnectOnForeground = false
-                connectionRecoveryState = .idle
-                recoverTrustedReconnectCandidate()
-                failAllPendingRequests(with: error)
-                return
-            }
-        } else if disposition.shouldClearSavedRelaySession || !shouldAutoReconnectOnForeground {
+        // Leave trusted reconnect failure accounting to the outer connect attempt so
+        // one transport drop cannot burn the retry budget twice.
+        if disposition.shouldClearSavedRelaySession || !shouldAutoReconnectOnForeground {
             trustedReconnectFailureCount = 0
         }
         connectionRecoveryState = disposition.connectionRecoveryState
@@ -996,7 +1019,7 @@ extension CodexService {
             return nil
         }
 
-        return "The saved Mac session is temporarily unavailable. Remodex will keep retrying. If you restarted the bridge on your Mac, scan the new QR code."
+        return "Trying to reach your saved Mac. Remodex will keep retrying. If you restarted the bridge on your Mac, scan the new QR code."
     }
 
     func retryableSessionUnavailableMessage(forConnectError error: Error) -> String? {
@@ -1004,7 +1027,7 @@ extension CodexService {
             return nil
         }
 
-        return "The saved Mac session is temporarily unavailable. Remodex will keep retrying. If you restarted the bridge on your Mac, scan the new QR code."
+        return "Trying to reach your saved Mac. Remodex will keep retrying. If you restarted the bridge on your Mac, scan the new QR code."
     }
 
     // Surfaces relay-enforced drops that keep the pairing valid but lost the current send.

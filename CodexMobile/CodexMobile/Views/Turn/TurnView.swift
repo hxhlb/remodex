@@ -10,11 +10,13 @@ import UIKit
 
 struct TurnView: View {
     let thread: CodexThread
+    let isWakingMacDisplayRecovery: Bool
 
     @Environment(CodexService.self) private var codex
     @Environment(SubscriptionService.self) private var subscriptions
     @Environment(\.openURL) private var openURL
     @Environment(\.reconnectAction) private var reconnectAction
+    @Environment(\.wakeMacDisplayAction) private var wakeMacDisplayAction
     @Environment(\.scenePhase) private var scenePhase
     @State private var viewModel = TurnViewModel()
     @State private var isInputFocused = false
@@ -37,6 +39,7 @@ struct TurnView: View {
     @State private var isVoicePreflighting = false
     @State private var voicePreflightGeneration = 0
     @State private var isVoiceTranscribing = false
+    @State private var hasTriggeredVoiceAutoStop = false
     @State private var voiceRecoveryReason: CodexVoiceFailureReason?
     @State private var isShowingVoiceSetupSheet = false
     @StateObject private var voiceTranscriptionManager = GPTVoiceTranscriptionManager()
@@ -314,6 +317,19 @@ struct TurnView: View {
         .onChange(of: renderSnapshot.timelineChangeToken) { _, _ in
             viewModel.reconcileDismissedStructuredPlanPrompts(messages: renderSnapshot.messages, codex: codex)
         }
+        .onReceive(voiceTranscriptionManager.$recordingDuration) { duration in
+            guard isVoiceRecording,
+                  !isVoiceTranscribing,
+                  !hasTriggeredVoiceAutoStop,
+                  duration >= voiceAutoStopThreshold else {
+                return
+            }
+
+            hasTriggeredVoiceAutoStop = true
+            Task { @MainActor in
+                await stopVoiceTranscription()
+            }
+        }
         .sheet(isPresented: $isShowingThreadPathSheet) {
             if let context = threadNavigationContext(for: resolvedThread) {
                 TurnThreadPathSheet(
@@ -432,7 +448,7 @@ struct TurnView: View {
 
         return AnyView(
             ConnectionRecoveryCard(snapshot: snapshot) {
-                reconnectAction?()
+                handleConnectionRecoveryAction()
             }
         )
     }
@@ -450,32 +466,26 @@ struct TurnView: View {
     }
 
     private var connectionRecoverySnapshot: ConnectionRecoverySnapshot? {
-        guard codex.hasReconnectCandidate,
-              !codex.isConnected,
-              codex.secureConnectionState != .rePairRequired else {
-            return nil
-        }
-
-        if codex.isConnecting || codex.shouldAutoReconnectOnForeground || isRetryingConnectionRecovery {
-            return ConnectionRecoverySnapshot(
-                summary: "Trying to reconnect to your Mac.",
-                status: .reconnecting,
-                trailingStyle: .progress
-            )
-        }
-
-        let trimmedError = codex.lastErrorMessage?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let summary = {
-            guard let trimmedError, !trimmedError.isEmpty else {
-                return "Reconnect to your Mac to keep this chat in sync."
-            }
-            return trimmedError
-        }()
-        return ConnectionRecoverySnapshot(
-            summary: summary,
-            status: .interrupted,
-            trailingStyle: .action("Reconnect")
+        TurnConnectionRecoverySnapshotBuilder.makeSnapshot(
+            hasReconnectCandidate: codex.hasReconnectCandidate,
+            isConnected: codex.isConnected,
+            secureConnectionState: codex.secureConnectionState,
+            showsWakeSavedMacDisplayAction: shouldOfferWakeSavedMacDisplayAction,
+            isWakingMacDisplayRecovery: isWakingMacDisplayRecovery,
+            isConnecting: codex.isConnecting,
+            shouldAutoReconnectOnForeground: codex.shouldAutoReconnectOnForeground,
+            isRetryingConnectionRecovery: isRetryingConnectionRecovery,
+            lastErrorMessage: codex.lastErrorMessage
         )
+    }
+
+    private var canWakeSavedMacDisplay: Bool {
+        codex.canWakePreferredMacDisplay
+    }
+
+    // Matches the root fallback gate so the turn card only offers wake after the silent attempt already ran.
+    private var shouldOfferWakeSavedMacDisplayAction: Bool {
+        canWakeSavedMacDisplay && wakeMacDisplayAction != nil
     }
 
     private var isRetryingConnectionRecovery: Bool {
@@ -1298,6 +1308,9 @@ struct TurnView: View {
                 onOpenWorktreeHandoff: {
                     handleWorktreeHandoffTap(currentThread: currentThread)
                 },
+                onOpenFeedbackMail: {
+                    openURL(AppEnvironment.feedbackMailtoURL)
+                },
                 onShowStatus: presentStatusSheet,
                 voiceButtonPresentation: voiceButtonPresentation,
                 isVoiceRecording: isVoiceRecording,
@@ -1379,6 +1392,7 @@ struct TurnView: View {
 
     // Stops the recorder, transcribes through the bridge, and appends the final text into the draft.
     private func stopVoiceTranscription() async {
+        hasTriggeredVoiceAutoStop = false
         isVoiceTranscribing = true
         defer { isVoiceTranscribing = false }
 
@@ -1429,6 +1443,7 @@ struct TurnView: View {
 
         clearVoiceRecovery()
         codex.lastErrorMessage = nil
+        hasTriggeredVoiceAutoStop = false
         // Dismiss any active text focus before recording so the keyboard does not
         // compete with the waveform UI or waste vertical space during capture.
         isInputFocused = false
@@ -1465,6 +1480,12 @@ struct TurnView: View {
 
         voiceTranscriptionManager.cancelRecording()
         isVoiceRecording = false
+        hasTriggeredVoiceAutoStop = false
+    }
+
+    // Trigger a hair before the hard validation limit so the saved WAV never misses by timer drift.
+    private var voiceAutoStopThreshold: TimeInterval {
+        max(0, CodexVoiceTranscriptionPreflight.maxDurationSeconds - 0.25)
     }
 
     private func clearVoiceRecovery() {
@@ -1609,6 +1630,15 @@ struct TurnView: View {
         case .none:
             break
         }
+    }
+
+    private func handleConnectionRecoveryAction() {
+        if shouldOfferWakeSavedMacDisplayAction {
+            wakeMacDisplayAction?()
+            return
+        }
+
+        reconnectAction?()
     }
 
     // Invalidates any in-flight async mic startup so it cannot reopen the recorder after leaving the screen.
@@ -1822,7 +1852,10 @@ private struct RuntimeDebugLogSheet: View {
 
 #Preview {
     NavigationStack {
-        TurnView(thread: CodexThread(id: "thread_preview", title: "Preview"))
+        TurnView(
+            thread: CodexThread(id: "thread_preview", title: "Preview"),
+            isWakingMacDisplayRecovery: false
+        )
             .environment(CodexService())
     }
 }

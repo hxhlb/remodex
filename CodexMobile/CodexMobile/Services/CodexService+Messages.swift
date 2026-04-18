@@ -74,8 +74,7 @@ extension CodexService {
     // Treats placeholder-only chats as intentionally blank so the UI does not flash
     // a loading state before the thread-open preparation path can confirm the skip.
     func shouldShowImmediateEmptyPlaceholder(threadId: String) -> Bool {
-        guard !hydratedThreadIDs.contains(threadId),
-              !threadHasActiveOrRunningTurn(threadId),
+        guard !threadHasActiveOrRunningTurn(threadId),
               messages(for: threadId).isEmpty,
               let thread = thread(for: threadId),
               thread.syncState == .live else {
@@ -87,6 +86,8 @@ extension CodexService {
             return false
         }
 
+        // Keep a brand-new blank chat on the empty composer even if a hydration
+        // race briefly toggled the thread into a loading state behind the scenes.
         return thread.displayTitle == CodexThread.defaultDisplayTitle
     }
 
@@ -390,8 +391,7 @@ extension CodexService {
     // Returns sidebar-only chat badge state. This intentionally stays separate from
     // per-turn runtime truth so "chat finished unread" does not leak into timeline logic.
     func threadRunBadgeState(for threadId: String) -> CodexThreadRunBadgeState? {
-        if runningThreadIDs.contains(threadId)
-            || activeTurnIdByThread[threadId] != nil {
+        if threadHasActiveOrRunningTurn(threadId) {
             return .running
         }
         if failedThreadIDs.contains(threadId) {
@@ -423,8 +423,8 @@ extension CodexService {
         updateBackgroundRunGraceTask()
     }
 
-    // Hides the visible running state when a stop attempt proves we still do not have a
-    // usable turn id, while keeping fallback recovery alive in the background.
+    // Drops the eager runtime-running flag after a stop attempt proves the server still
+    // has not published a usable turn id, while keeping protected fallback recovery alive.
     func demoteVisibleRunningStateToProtectedFallback(for threadId: String) {
         runningThreadIDs.remove(threadId)
         refreshBusyRepoRootsAndDependentTimelineStates()
@@ -2866,7 +2866,7 @@ extension CodexService {
         let messages = messagesByThread[threadId] ?? []
         let revision = messageRevisionByThread[threadId] ?? 0
         let activeTurnID = activeTurnIdByThread[threadId]
-        let isThreadRunning = activeTurnID != nil || runningThreadIDs.contains(threadId)
+        let isThreadRunning = threadHasActiveOrRunningTurn(threadId)
         let projectionSourceMessages = snapshotProjectionSourceMessages(from: messages)
         let stoppedTurnIDs = rebuildStoppedTurnIDs(for: threadId, messages: projectionSourceMessages)
         let latestTurnTerminalState = latestTurnTerminalStateByThread[threadId]

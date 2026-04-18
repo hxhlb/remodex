@@ -388,6 +388,8 @@ private struct TurnTimelineFooterContainer<Composer: View>: View {
 }
 
 struct TurnTimelineView<EmptyState: View, Composer: View>: View {
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+
     let threadID: String
     let messages: [CodexMessage]
     let timelineChangeToken: Int
@@ -467,6 +469,12 @@ struct TurnTimelineView<EmptyState: View, Composer: View>: View {
         shouldWarmRecentTailProgressively && visibleTailCount == 0
     }
 
+    // Keeps larger accessibility text inside a slightly roomier gutter so assistant
+    // prose does not read as edge-to-edge when Dynamic Type is bumped up.
+    private var timelineHorizontalPadding: CGFloat {
+        dynamicTypeSize.isAccessibilitySize ? 20 : 16
+    }
+
     private var shouldStageHeavyThreadOpen: Bool {
         false
     }
@@ -526,7 +534,7 @@ struct TurnTimelineView<EmptyState: View, Composer: View>: View {
                             onLoadEarlierMessages: handleLoadEarlierMessages
                         )
                     }
-                    .padding(.horizontal, 16)
+                    .padding(.horizontal, timelineHorizontalPadding)
                     .padding(.top, 12)
                     .padding(.bottom, 12)
 
@@ -1168,22 +1176,12 @@ struct TurnTimelineView<EmptyState: View, Composer: View>: View {
             )
 
             // Aggregate file-change entries across the block for the turn-end Diff button.
-            let fileChangeMessages = messages[blockStart...blockEnd].filter {
+            let fileChangeMessages = Array(messages[blockStart...blockEnd].filter {
                 $0.role == .system && $0.kind == .fileChange && !$0.isStreaming
-            }
-            let blockDiffEntries: [TurnFileChangeSummaryEntry]? = fileChangeMessages.isEmpty ? nil : {
-                var allEntries: [TurnFileChangeSummaryEntry] = []
-                for msg in fileChangeMessages {
-                    if let parsed = TurnFileChangeSummaryParser.parse(from: msg.text) {
-                        allEntries.append(contentsOf: parsed.entries)
-                    }
-                }
-                return allEntries.isEmpty ? nil : allEntries
-            }()
-            let blockDiffText: String? = fileChangeMessages.isEmpty ? nil :
-                fileChangeMessages.map { $0.text.trimmingCharacters(in: .whitespacesAndNewlines) }
-                    .filter { !$0.isEmpty }
-                    .joined(separator: "\n\n")
+            })
+            let blockDiffPresentation = FileChangeBlockPresentationBuilder.build(from: fileChangeMessages)
+            let blockDiffText = blockDiffPresentation?.bodyText
+            let blockDiffEntries = blockDiffPresentation?.entries
 
             // Use the last assistant revert presentation in this block.
             let blockRevert = messages[blockStart...blockEnd]

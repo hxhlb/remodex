@@ -103,6 +103,7 @@ struct MarkdownTextView: View {
     let text: String
     let profile: MarkdownRenderProfile
     var enablesSelection: Bool = false
+    var constrainsToAvailableWidth: Bool = false
 
     var body: some View {
         let transformed = MarkdownTextFormatter.renderableText(from: text, profile: profile)
@@ -115,11 +116,21 @@ struct MarkdownTextView: View {
             .textual.structuredTextStyle(.gitHub)
             .textual.overflowMode(.wrap)
 
-        if enablesSelection {
-            baseView
-                .textual.textSelection(.enabled)
+        let renderedContent = Group {
+            if enablesSelection {
+                baseView
+                    .textual.textSelection(.enabled)
+            } else {
+                baseView
+            }
+        }
+
+        if constrainsToAvailableWidth {
+            renderedContent
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .fixedSize(horizontal: false, vertical: true)
         } else {
-            baseView
+            renderedContent
         }
     }
 }
@@ -938,6 +949,15 @@ struct MessageRow: View, Equatable {
             && visibleAssistantText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && inferredQuestionnaire == nil
             && mermaidContent == nil
+        // Prefer copying the exact assistant block the user can see instead of the
+        // whole non-user turn aggregate assembled by the timeline footer cache.
+        let assistantCopyText: String? = {
+            let trimmedVisibleText = visibleAssistantText.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmedVisibleText.isEmpty {
+                return trimmedVisibleText
+            }
+            return assistantBlockAccessoryState?.copyText
+        }()
         let hasRenderableAssistantContent = !visibleAssistantText.isEmpty || proposedPlan != nil
         return VStack(alignment: .leading, spacing: 8) {
             if let commentContent, commentContent.hasFindings {
@@ -956,7 +976,8 @@ struct MessageRow: View, Equatable {
                         MarkdownTextView(
                             text: introText,
                             profile: .assistantProse,
-                            enablesSelection: enablesInlineMarkdownSelectionInTimeline
+                            enablesSelection: enablesInlineMarkdownSelectionInTimeline,
+                            constrainsToAvailableWidth: true
                         )
                     }
 
@@ -977,7 +998,8 @@ struct MessageRow: View, Equatable {
                         MarkdownTextView(
                             text: renderedPlanText,
                             profile: .assistantProse,
-                            enablesSelection: enablesInlineMarkdownSelectionInTimeline
+                            enablesSelection: enablesInlineMarkdownSelectionInTimeline,
+                            constrainsToAvailableWidth: true
                         )
                     }
 
@@ -991,7 +1013,8 @@ struct MessageRow: View, Equatable {
                     MarkdownTextView(
                         text: visibleAssistantText,
                         profile: .assistantProse,
-                        enablesSelection: enablesInlineMarkdownSelectionInTimeline
+                        enablesSelection: enablesInlineMarkdownSelectionInTimeline,
+                        constrainsToAvailableWidth: true
                     )
                 }
             }
@@ -1006,7 +1029,7 @@ struct MessageRow: View, Equatable {
 
             if !suppressNativeProposedPlanShell, let assistantBlockAccessoryState {
                 CopyBlockButton(
-                    text: assistantBlockAccessoryState.copyText,
+                    text: assistantCopyText,
                     isRunning: assistantBlockAccessoryState.showsRunningIndicator
                 )
             }
