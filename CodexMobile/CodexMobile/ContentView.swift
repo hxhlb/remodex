@@ -588,6 +588,9 @@ struct ContentView: View {
         NewChatDraftView(
             route: route,
             leadingControl: .back,
+            onOpenTerminal: { workingDirectory in
+                openTerminal(preferredWorkingDirectory: workingDirectory)
+            },
             onOpenThread: { thread in
                 openThreadFromNewChatDraft(thread)
             }
@@ -649,6 +652,9 @@ struct ContentView: View {
             NewChatDraftView(
                 route: activeNewChatDraftRoute,
                 leadingControl: .hamburger(action: { openSidebarPresentation() }),
+                onOpenTerminal: { workingDirectory in
+                    openTerminal(preferredWorkingDirectory: workingDirectory)
+                },
                 onOpenThread: { thread in
                     openThreadFromNewChatDraft(thread)
                 }

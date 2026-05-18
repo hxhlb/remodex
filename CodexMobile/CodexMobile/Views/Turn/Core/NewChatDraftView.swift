@@ -40,6 +40,7 @@ struct NewChatDraftView: View {
 
     let route: NewChatDraftRoute
     var leadingControl: NewChatDraftLeadingControl = .back
+    var onOpenTerminal: ((String?) -> Void)? = nil
     let onOpenThread: (CodexThread) -> Void
 
     @State private var viewModel = TurnViewModel()
@@ -48,6 +49,12 @@ struct NewChatDraftView: View {
     @State private var projectlessChatRootPaths: [String] = []
     @State private var activeSheet: NewChatDraftSheet?
     @State private var hasInitializedProjectSelection = false
+    @State private var isLoadingRepositoryDiff = false
+    @State private var repositoryDiffPresentation: TurnDiffPresentation?
+    @State private var alertApprovalRequest: CodexApprovalRequest?
+    @State private var isApprovalAlertPresented = false
+    @State private var isShowingMacHandoffConfirm = false
+    @State private var macHandoffErrorMessage: String?
 
     // UI-only check for layout experiments: true when opened from the general
     // sidebar Chat affordance, false when opened from a folder section button.
@@ -90,20 +97,66 @@ struct NewChatDraftView: View {
                     toolbarTitleLabel
                 }
             }
+
+            ToolbarItem(placement: .topBarTrailing) {
+                draftGitActionsButton
+            }
+
+            if #available(iOS 26.0, *) {
+                ToolbarSpacer(.fixed, placement: .topBarTrailing)
+            }
+
+            ToolbarItem(placement: .topBarTrailing) {
+                draftThreadActionsMenu
+            }
         }
         .task {
             initializeProjectSelectionIfNeeded()
             await refreshProjectlessChatRoots()
+            refreshDraftGitStateIfNeeded()
         }
         .onChange(of: projectChoices) { _, _ in
             initializeProjectSelectionIfNeeded()
+            refreshDraftGitStateIfNeeded()
         }
         .onChange(of: selectedProjectPath) { _, _ in
             viewModel.clearComposerAutocomplete()
+            refreshDraftGitStateIfNeeded()
         }
         .sheet(item: $activeSheet) { sheet in
             sheetContent(sheet)
         }
+        .sheet(item: $repositoryDiffPresentation) { presentation in
+            TurnDiffSheet(
+                title: presentation.title,
+                entries: presentation.entries,
+                bodyText: presentation.bodyText,
+                messageID: presentation.messageID
+            )
+        }
+        .turnViewAlerts(
+            alertApprovalRequest: $alertApprovalRequest,
+            isApprovalAlertPresented: $isApprovalAlertPresented,
+            isShowingNothingToCommitAlert: isShowingNothingToCommitAlertBinding,
+            gitSyncAlert: gitSyncAlertBinding,
+            isShowingMacHandoffConfirm: $isShowingMacHandoffConfirm,
+            macHandoffErrorMessage: $macHandoffErrorMessage,
+            onDeclineApproval: { _ in },
+            onApproveApproval: { _ in },
+            onConfirmGitSyncAction: { action in
+                viewModel.confirmGitSyncAlertAction(
+                    action,
+                    codex: codex,
+                    workingDirectory: selectedProjectPath,
+                    threadID: route.id,
+                    activeTurnID: nil
+                )
+            },
+            onDismissGitSyncAlert: {
+                viewModel.dismissGitSyncAlert()
+            },
+            onConfirmMacHandoff: {}
+        )
         .fullScreenCover(isPresented: isCameraPresentedBinding) {
             CameraImagePicker { data in
                 viewModel.enqueueCapturedImageData(data, codex: codex, threadID: route.id)
@@ -166,7 +219,7 @@ struct NewChatDraftView: View {
                 .resizable()
                 .scaledToFit()
                 .frame(width: 50, height: 50)
-                .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+                .clipShape(RoundedRecta ngle(cornerRadius: 18, style: .continuous))
                 .adaptiveGlass(in: RoundedRectangle(cornerRadius: 18, style: .continuous))
             ChatEmptyStateTitleBuilder.makeTitle(for: placeholderFolderName)
                 .font(AppFont.title2(weight: .regular))
@@ -186,6 +239,153 @@ struct NewChatDraftView: View {
             subtitle: placeholderFolderName ?? trustedHostName,
             onTap: { activeSheet = .projectPicker },
             accessibilityHint: "Opens the project picker"
+        )
+    }
+
+    // Only Quick Chat / no-folder drafts are blocked. If the draft already has
+    // a selected project (including the default latest-used project from the
+    // general Chat button), expose the same Git state/actions as TurnView.
+    private var draftGitActionsButton: some View {
+        TurnGitActionsToolbarButton(
+            isEnabled: isDraftGitActionEnabled,
+            disabledActions: areDraftToolbarActionsDisabled ? Set(TurnGitActionKind.allCases) : viewModel.disabledGitActions,
+            isRunningAction: viewModel.isRunningGitAction,
+            loadingTitle: nil,
+            showsDiscardRuntimeChangesAndSync: viewModel.shouldShowDiscardRuntimeChangesAndSync,
+            gitSyncState: viewModel.gitSyncState,
+            repoDiffTotals: viewModel.gitRepoSync?.repoDiffTotals,
+            isLoadingRepoDiff: isLoadingRepositoryDiff,
+            onTapRepoDiff: areDraftToolbarActionsDisabled ? nil : {
+                presentRepositoryDiff()
+            },
+            onSelect: handleDraftGitActionSelection
+        )
+        .opacity(areDraftToolbarActionsDisabled ? 0.45 : 1)
+        .disabled(areDraftToolbarActionsDisabled)
+    }
+
+    // Mirrors the regular chat ellipsis chrome. It is disabled only for the
+    // general Chat draft, where the folder can still change before first send.
+    private var draftThreadActionsMenu: some View {
+        Menu {
+            Button {
+                HapticFeedback.shared.triggerImpactFeedback(style: .light)
+                onOpenTerminal?(selectedProjectPath)
+            } label: {
+                HStack(spacing: 10) {
+                    RemodexIcon.image(systemName: "terminal", size: 13, weight: .semibold)
+                    Text("Open Terminal Here")
+                }
+            }
+            .disabled(areDraftToolbarActionsDisabled || onOpenTerminal == nil)
+        } label: {
+            TurnMacHandoffToolbarLabel(isLoading: false)
+        }
+        .opacity(areDraftToolbarActionsDisabled ? 0.45 : 1)
+        .disabled(areDraftToolbarActionsDisabled)
+        .accessibilityLabel("Thread actions")
+    }
+
+    private var areDraftToolbarActionsDisabled: Bool {
+        !hasSelectedProject
+    }
+
+    private var isDraftGitActionEnabled: Bool {
+        !areDraftToolbarActionsDisabled
+            && viewModel.gitRepoSync != nil
+            && viewModel.canRunGitAction(
+                isConnected: codex.isConnected,
+                isThreadRunning: false,
+                hasGitWorkingDirectory: selectedProjectPath != nil
+            )
+    }
+
+    // Preloads the same repo/branch status TurnView uses whenever there is an
+    // actual selected project. General Chat starts enabled too if it defaulted
+    // to the latest-used project; only Quick Chat stays blocked.
+    private func refreshDraftGitStateIfNeeded() {
+        guard hasSelectedProject, codex.isConnected else {
+            return
+        }
+        viewModel.refreshGitBranchTargets(
+            codex: codex,
+            workingDirectory: selectedProjectPath,
+            threadID: route.id
+        )
+    }
+
+    private var hasSelectedProject: Bool {
+        selectedProjectPath?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+    }
+
+    private func handleDraftGitActionSelection(_ action: TurnGitActionKind) {
+        guard isDraftGitActionEnabled else { return }
+        viewModel.triggerGitAction(
+            action,
+            codex: codex,
+            workingDirectory: selectedProjectPath,
+            threadID: route.id,
+            activeTurnID: nil
+        )
+    }
+
+    // Fetches the repo patch for folder-backed drafts so the Git menu's
+    // "Changes" row matches the regular TurnView toolbar behavior.
+    private func presentRepositoryDiff() {
+        guard !isLoadingRepositoryDiff,
+              !areDraftToolbarActionsDisabled else {
+            return
+        }
+        isLoadingRepositoryDiff = true
+
+        Task { @MainActor in
+            defer { isLoadingRepositoryDiff = false }
+
+            let gitService = GitActionsService(codex: codex, workingDirectory: selectedProjectPath)
+            do {
+                let result = try await gitService.diff()
+                guard let presentation = TurnDiffPresentationBuilder.repositoryPresentation(from: result.patch) else {
+                    viewModel.gitSyncAlert = TurnGitSyncAlert(
+                        title: "Git Error",
+                        message: "There are no repository changes to show.",
+                        action: .dismissOnly
+                    )
+                    return
+                }
+                repositoryDiffPresentation = presentation
+            } catch let error as GitActionsError {
+                viewModel.gitSyncAlert = TurnGitSyncAlert(
+                    title: "Git Error",
+                    message: error.errorDescription ?? "Could not load repository changes.",
+                    action: .dismissOnly
+                )
+            } catch {
+                viewModel.gitSyncAlert = TurnGitSyncAlert(
+                    title: "Git Error",
+                    message: error.localizedDescription,
+                    action: .dismissOnly
+                )
+            }
+        }
+    }
+
+    private var isShowingNothingToCommitAlertBinding: Binding<Bool> {
+        Binding(
+            get: { viewModel.isShowingNothingToCommitAlert },
+            set: { viewModel.isShowingNothingToCommitAlert = $0 }
+        )
+    }
+
+    private var gitSyncAlertBinding: Binding<TurnGitSyncAlert?> {
+        Binding(
+            get: { viewModel.gitSyncAlert },
+            set: { newValue in
+                if let newValue {
+                    viewModel.gitSyncAlert = newValue
+                } else {
+                    viewModel.dismissGitSyncAlert()
+                }
+            }
         )
     }
 
@@ -262,11 +462,18 @@ struct NewChatDraftView: View {
             orderedModelOptions: orderedModelOptions,
             selectedModelTitle: selectedModelTitle,
             reasoningDisplayOptions: reasoningDisplayOptions,
-            showsGitControls: false,
-            isGitBranchSelectorEnabled: false,
+            showsGitControls: hasSelectedProject && viewModel.isGitRepositoryInitialized,
+            isGitBranchSelectorEnabled: isDraftGitActionEnabled && viewModel.isGitRepositoryInitialized,
             onSelectGitBranch: { _ in },
             onCreateGitBranch: { _ in },
-            onRefreshGitBranches: {},
+            onRefreshGitBranches: {
+                guard hasSelectedProject, viewModel.isGitRepositoryInitialized else { return }
+                viewModel.refreshGitBranchTargets(
+                    codex: codex,
+                    workingDirectory: selectedProjectPath,
+                    threadID: route.id
+                )
+            },
             onStartCodeReviewThread: { target in
                 viewModel.applyPendingComposerAction(.codeReview(target: target.codexPendingTarget))
             },
@@ -287,7 +494,7 @@ struct NewChatDraftView: View {
             onTapVoice: {},
             onCancelVoiceRecording: {},
             onSend: sendDraft,
-            showsSecondaryBar: false
+            showsSecondaryBar: hasSelectedProject
         )
     }
 
