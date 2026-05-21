@@ -168,6 +168,7 @@ struct ContentView: View {
                             return
                         }
 
+                        await codex.probeForegroundConnectionIfNeeded()
                         await attemptSavedMacReconnectRecoveryIfNeeded()
                         await subscriptionRefresh
                         scheduleSidebarPrewarmIfNeeded()
@@ -914,7 +915,6 @@ struct ContentView: View {
             && hasSeenOnboarding
             && !isShowingManualScanner
             && !isShowingManualPairingEntry
-            && codex.shouldAutoReconnectOnForeground
             && canWakeSavedMacDisplay
             && codex.supportsDisplayWake
             && !hasAttemptedAutomaticWakeSavedMacDisplay
